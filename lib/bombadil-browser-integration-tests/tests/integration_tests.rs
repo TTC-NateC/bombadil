@@ -9,7 +9,10 @@ use axum::{
 use bombadil_browser_integration_tests::{Semaphore, SemaphoreGuard};
 use bombadil_schema::{Time, markup};
 use rand::SeedableRng;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicBool},
+};
 use std::{
     fmt::Display,
     sync::Once,
@@ -324,6 +327,7 @@ impl<'a> BrowserIntegrationTest<'a> {
             specification,
             browser_options,
             debugger_options,
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("run_test failed");
 
@@ -541,6 +545,66 @@ export const counterStateMachine = always(unchanged.or(increment).or(decrement))
         )
         .run()
         ;
+}
+
+#[test]
+fn test_scroll_settles_before_next_state() {
+    BrowserIntegrationTest::new("scroll-race")
+        .time_limit(Duration::from_secs(2))
+        .specification(
+            r#"
+import { now, next, always } from "@antithesishq/bombadil";
+import { actions, extract } from "@antithesishq/bombadil/browser";
+import { lastAction } from "@antithesishq/bombadil/browser/defaults/actions";
+
+const scrollY = extract((state) => state.window.scrollY);
+const innerHeight = extract((state) => state.window.innerHeight);
+const maxScrollY = extract(
+  (state) =>
+    (state.document.body?.scrollHeight ?? 0) - state.window.innerHeight,
+);
+
+// Only scroll down; wait once we've reached the bottom so the runner keeps
+// evaluating the property until the time limit fires.
+export const scrollDown = actions(() => {
+  const remaining = maxScrollY.current - scrollY.current;
+  if (remaining < 1) return ["Wait"];
+  return [
+    {
+      ScrollDown: {
+        origin: { x: 400, y: innerHeight.current / 2 },
+        distance: Math.min(innerHeight.current / 2, remaining),
+      },
+    },
+  ];
+});
+
+// If the last action was a scroll, window.scrollY in the state that follows
+// must be offset from the previous scrollY by exactly the scroll distance.
+// If state is captured before the synthesized scroll gesture has finished,
+// this property observes a partial scroll and fails.
+//
+// TODO: this should ideally be defined using an `until` operator when that
+// is implemented, where the stop condition is "at end of document".
+export const scrollSettlesBeforeNextState = always(() => {
+  const previous = scrollY.current;
+  return next(() => {
+    const action = lastAction.current;
+    if (!action || typeof action !== "object") return true;
+    let expected;
+    if ("ScrollDown" in action) {
+      expected = previous + action.ScrollDown.distance;
+    } else if ("ScrollUp" in action) {
+      expected = previous - action.ScrollUp.distance;
+    } else {
+      return true;
+    }
+    return Math.abs(scrollY.current - expected) < 2;
+  });
+});
+"#,
+        )
+        .run();
 }
 
 #[test]
