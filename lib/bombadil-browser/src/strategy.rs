@@ -1,8 +1,9 @@
 use crate::browser::actions::BrowserActionTemplate;
-use crate::render::format_action;
+use crate::driver::BrowserSession;
 use crate::url::is_within_domain;
 use anyhow::{Result, bail};
-use bombadil::render::format_timestamp;
+use bombadil::driver::{ActionTemplate, RunState};
+use bombadil::render::Formatted;
 use bombadil::runner::PropertiesState;
 use bombadil::styled;
 use bombadil::{specification::domain::Snapshot, tree::Tree};
@@ -13,7 +14,6 @@ use url::Url;
 use crate::{
     browser::{actions::BrowserAction, state::BrowserState},
     convert::ToSchema,
-    driver::BrowserDriver,
     runner::{ControlFlow, PropertyViolation, RunStrategy},
 };
 use bombadil_schema::markup;
@@ -96,14 +96,14 @@ impl<Writer: TraceWriter, Rng: TryRng + RngExt> TestStrategy<Writer, Rng> {
                             styled::maybe_red(styled::maybe_bold(
                                 "no match for original:".into()
                             )),
-                            format_action(&action_original),
+                            Formatted(&action_original),
                             styled::maybe_red(styled::maybe_bold(
                                 "in the set of available actions:".into()
                             )),
                             tree.values()
                                 .iter()
                                 .copied()
-                                .map(format_action)
+                                .map(|action| format!("{}", Formatted(action)))
                                 .collect::<Vec<String>>()
                                 .join("\n")
                         );
@@ -119,7 +119,7 @@ impl<Writer: TraceWriter, Rng: TryRng + RngExt> TestStrategy<Writer, Rng> {
     }
 }
 
-impl<Writer: TraceWriter, Rng: TryRng + RngExt> RunStrategy<BrowserDriver>
+impl<Writer: TraceWriter, Rng: TryRng + RngExt> RunStrategy<BrowserSession>
     for TestStrategy<Writer, Rng>
 {
     type StopValue = TestResult;
@@ -194,11 +194,13 @@ impl<Writer: TraceWriter, Rng: TryRng + RngExt> RunStrategy<BrowserDriver>
         }
 
         let action = self.pick_action(state, tree)?;
-        println!(
-            "{} {}",
-            format_timestamp(state.timestamp, test_start),
-            format_action(&action)
+        let elapsed = std::time::Duration::from_micros(
+            state
+                .timestamp()
+                .as_micros()
+                .saturating_sub(test_start.as_micros()),
         );
+        println!("{} {}", Formatted(&elapsed), Formatted(&action));
 
         Ok(ControlFlow::Continue(action))
     }

@@ -3,7 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use bombadil::driver::FromGeneratedAction;
+use bombadil::driver::{ActionTemplate, FromGeneratedAction};
 use bombadil::specification::generators::StringGenerator;
 use bombadil_schema::browser::Fingerprint;
 use cdp_protocol::cdp::browser_protocol::target::SessionId;
@@ -368,32 +368,34 @@ impl BrowserAction {
                     Some(session_id),
                 )?;
             }
-            BrowserAction::Custom {
-                name,
-                arguments: options,
-            } => {
+            BrowserAction::Custom { name, arguments } => {
                 let call = CallFunctionOnParamsBuilder::default().function_declaration(
-                    r#"async (name, options) => {
+                    r#"async (name, args) => {
                         try {
-                            await __bombadilRequire('@antithesishq/bombadil').runtime.runCustomAction(name, options);
+                            await __bombadilRequire('@antithesishq/bombadil').runtime.runCustomAction(name, args);
                         } catch (err) {
-                            throw new Error(`Error executing custom action ${JSON.stringify(name)}: ${err}`);
+                            throw new Error(`Error executing custom action ${JSON.stringify(name)}(${args.join(", ")}): ${err}`);
                         }
                     }"#
                 )
                     .argument(CallArgument::builder().value(json::json!(name)).build())
-                    .argument(CallArgument::builder().value(options.clone()).build())
+                    .argument(CallArgument::builder().value(arguments.clone()).build())
+                    .await_promise(true)
+                    .return_by_value(true)
                     .unique_context_id(unique_context_id.ok_or(anyhow!("no unique_context_id available, can't apply custom action"))?)
                 .build().map_err(|err| anyhow!(err))?;
-                connection.send(call, Some(session_id))?;
+                let result = connection.send(call, Some(session_id))?;
+                if let Some(exception) = result.exception_details {
+                    bail!("{}", exception)
+                }
             }
         };
         Ok(())
     }
 }
 
-impl BrowserActionTemplate {
-    pub fn generate<Rng: rand::TryRng + rand::RngExt>(
+impl ActionTemplate<BrowserAction> for BrowserActionTemplate {
+    fn generate<Rng: rand::TryRng + rand::RngExt>(
         &self,
         rng: &mut Rng,
     ) -> BrowserAction {
@@ -470,7 +472,7 @@ impl BrowserActionTemplate {
         }
     }
 
-    pub fn accepts(&self, original: &BrowserAction) -> bool {
+    fn accepts(&self, original: &BrowserAction) -> bool {
         match (self, original) {
             (BrowserAction::Back, BrowserAction::Back) => true,
             (BrowserAction::Forward, BrowserAction::Forward) => true,

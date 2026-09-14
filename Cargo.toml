@@ -15,13 +15,13 @@ members = [
     "lib/cdp/pdl",
     "lib/cdp/protocol",
     "lib/small-string",
+    "lib/stdx",
     "lib/typescript-reference",
-    "lib/willow-tree",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
 
 [workspace.dependencies]
