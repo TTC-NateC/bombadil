@@ -4,11 +4,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use anyhow::Result;
+use bombadil::render::Format;
+use bombadil_schema::Time;
 use serde::{Deserialize, Serialize};
 use serde_json as json;
 use tempfile::NamedTempFile;
 
-use bombadil::driver::{DriverEvent, FromGeneratedAction, InterfaceDriver};
+use bombadil::driver::{
+    ActionTemplate, DriverEvent, FromGeneratedAction, InterfaceDriver,
+    InterfaceSession, RunState,
+};
 use bombadil::runner::{self, ControlFlow, PropertiesState, RunStrategy};
 use bombadil::specification::bundler::bundle;
 use bombadil::specification::domain::Snapshot;
@@ -17,6 +22,28 @@ use bombadil::tree::Tree;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FakeAction;
+
+impl Format for FakeAction {
+    fn format(
+        &self,
+        f: &mut std::fmt::Formatter,
+    ) -> std::prelude::v1::Result<(), std::fmt::Error> {
+        write!(f, "Fake action")
+    }
+}
+
+impl ActionTemplate<FakeAction> for FakeAction {
+    fn generate<Rng: rand::TryRng + rand::RngExt>(
+        &self,
+        _rng: &mut Rng,
+    ) -> FakeAction {
+        self.clone()
+    }
+
+    fn accepts(&self, _original: &FakeAction) -> bool {
+        true
+    }
+}
 
 impl FromGeneratedAction for FakeAction {
     fn from_generated(_value: json::Value) -> Result<Self> {
@@ -27,6 +54,12 @@ impl FromGeneratedAction for FakeAction {
 #[derive(Debug)]
 struct FakeState;
 
+impl RunState for FakeState {
+    fn timestamp(&self) -> Time {
+        Time::from_system_time(SystemTime::UNIX_EPOCH)
+    }
+}
+
 struct FakeDriver {
     initiated: Arc<AtomicBool>,
     terminated: Arc<AtomicBool>,
@@ -34,14 +67,31 @@ struct FakeDriver {
 }
 
 impl InterfaceDriver for FakeDriver {
+    type Session = FakeSession;
+
+    fn initiate(
+        &self,
+    ) -> std::result::Result<(FakeSession, Verifier), anyhow::Error> {
+        self.initiated.store(true, Ordering::SeqCst);
+        Ok((
+            FakeSession {
+                terminated: self.terminated.clone(),
+                next_event_calls: self.next_event_calls.clone(),
+            },
+            dummy_verifier(),
+        ))
+    }
+}
+
+struct FakeSession {
+    terminated: Arc<AtomicBool>,
+    next_event_calls: Arc<AtomicUsize>,
+}
+
+impl InterfaceSession for FakeSession {
     type Action = FakeAction;
     type ActionTemplate = FakeAction;
     type State = FakeState;
-
-    fn initiate(&mut self) -> Result<()> {
-        self.initiated.store(true, Ordering::SeqCst);
-        Ok(())
-    }
 
     fn terminate(&mut self) -> Result<()> {
         self.terminated.store(true, Ordering::SeqCst);
@@ -78,7 +128,7 @@ struct FakeStrategy {
     on_interrupted_calls: Arc<AtomicUsize>,
 }
 
-impl RunStrategy<FakeDriver> for FakeStrategy {
+impl RunStrategy<FakeSession> for FakeStrategy {
     type StopValue = ();
 
     fn on_new_state(
@@ -120,7 +170,7 @@ fn interrupt_before_run_terminates_driver_and_invokes_on_interrupted() {
     let next_event_calls = Arc::new(AtomicUsize::new(0));
     let on_interrupted_calls = Arc::new(AtomicUsize::new(0));
 
-    let mut driver = FakeDriver {
+    let driver = FakeDriver {
         initiated: initiated.clone(),
         terminated: terminated.clone(),
         next_event_calls: next_event_calls.clone(),
@@ -130,7 +180,9 @@ fn interrupt_before_run_terminates_driver_and_invokes_on_interrupted() {
         on_interrupted_calls: on_interrupted_calls.clone(),
     };
 
-    runner::run(&mut driver, &mut strategy, dummy_verifier(), interrupted)
+    let (mut session, verifier) =
+        driver.initiate().expect("driver failed to initiate");
+    runner::run(&mut session, &mut strategy, verifier, interrupted)
         .expect("runner returned Err");
 
     assert!(
