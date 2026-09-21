@@ -1,12 +1,14 @@
-use std::fmt::Debug;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::SystemTime;
+use std::{fmt::Debug, hash::Hasher};
 
 use anyhow::Result;
 use bombadil_schema::Time;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json as json;
 
+use crate::runner::PropertyViolation;
 use crate::{
     render::Format,
     specification::{domain::Snapshot, verifier::Verifier},
@@ -25,10 +27,19 @@ impl FromGeneratedAction for json::Value {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Default)]
+pub struct RunId(pub u64);
+
+impl Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A driver runs a user interface of some sort (the system under test).
 pub trait InterfaceDriver {
     type Session: InterfaceSession;
-    fn initiate(&self) -> Result<(Self::Session, Verifier)>;
+    fn new_session(&self, run_id: RunId) -> Result<(Self::Session, Verifier)>;
 }
 
 pub trait RunState {
@@ -42,6 +53,61 @@ pub trait ActionTemplate<Action> {
     ) -> Action;
 
     fn accepts(&self, original: &Action) -> bool;
+
+    fn category_hash<H: Hasher>(&self, hasher: &mut H);
+}
+
+pub trait OutputWriter<Session: InterfaceSession> {
+    type TraceWriter: TraceWriter<Session>;
+    fn trace_writer(&mut self, run_id: RunId) -> Result<Self::TraceWriter>;
+}
+
+pub trait TraceWriter<Session: InterfaceSession> {
+    fn write(
+        &mut self,
+        state: &Session::State,
+        last_action: Option<&Session::Action>,
+        snapshots: &[Snapshot],
+        violations: &[PropertyViolation],
+    ) -> Result<()>;
+}
+
+impl<Session: InterfaceSession> TraceWriter<Session>
+    for Box<dyn TraceWriter<Session>>
+{
+    fn write(
+        &mut self,
+        state: &<Session as InterfaceSession>::State,
+        last_action: Option<&<Session as InterfaceSession>::Action>,
+        snapshots: &[Snapshot],
+        violations: &[PropertyViolation],
+    ) -> Result<()> {
+        (**self).write(state, last_action, snapshots, violations)
+    }
+}
+
+pub struct NoopOutputWriter;
+
+impl<Session: InterfaceSession> OutputWriter<Session> for NoopOutputWriter {
+    type TraceWriter = NoopTraceWriter;
+
+    fn trace_writer(&mut self, _: RunId) -> Result<Self::TraceWriter> {
+        Ok(NoopTraceWriter)
+    }
+}
+
+pub struct NoopTraceWriter;
+
+impl<Session: InterfaceSession> TraceWriter<Session> for NoopTraceWriter {
+    fn write(
+        &mut self,
+        _state: &Session::State,
+        _last_action: Option<&Session::Action>,
+        _snapshots: &[Snapshot],
+        _violations: &[PropertyViolation],
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait InterfaceSession {
@@ -50,7 +116,9 @@ pub trait InterfaceSession {
         + Debug
         + Serialize
         + DeserializeOwned
+        + Format
         + FromGeneratedAction
+        + PartialEq
         + ActionTemplate<Self::Action>;
     type State: RunState + Debug;
 

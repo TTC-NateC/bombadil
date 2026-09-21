@@ -4,9 +4,12 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use bombadil::driver::{DriverEvent, InterfaceDriver, InterfaceSession};
-use bombadil::specification::domain::Snapshot;
+use bombadil::driver::RunId;
 use bombadil::specification::verifier::Verifier;
+use bombadil::{
+    driver::{DriverEvent, InterfaceDriver, InterfaceSession},
+    specification::domain::Snapshot,
+};
 use bombadil_schema::Time;
 use serde::Deserialize;
 use serde_json as json;
@@ -40,7 +43,7 @@ pub struct BrowserDriver {
 impl InterfaceDriver for BrowserDriver {
     type Session = BrowserSession;
 
-    fn initiate(&self) -> Result<(Self::Session, Verifier)> {
+    fn new_session(&self, _: RunId) -> Result<(Self::Session, Verifier)> {
         let verifier = Verifier::new(&self.specification_bundle)?;
 
         let coverage = if self.browser_options.instrumentation
