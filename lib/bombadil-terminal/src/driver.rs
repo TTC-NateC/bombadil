@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::hash::Hash;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -7,9 +8,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow};
 use bombadil::driver::{
-    ActionTemplate, DriverEvent, InterfaceDriver, InterfaceSession,
+    ActionTemplate, DriverEvent, InterfaceDriver, InterfaceSession, RunId,
 };
-use bombadil::render::Format;
+use bombadil::render::{Format, Formatted};
 use bombadil::specification::bundler::bundle;
 use bombadil::specification::convert::{ToInternal, ToSchema};
 use bombadil::specification::domain::Snapshot;
@@ -45,7 +46,12 @@ const INITIATE_STARTUP_DELAY: Duration = Duration::from_millis(1000);
 /// time.
 const DRAIN_DURATION_MAX: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// If no output has arrived from the child for this long AND input bytes
+/// have been dropped since the last output, treat the child as hung and
+/// surface it as a driver error (which ends the current run).
+const HANG_QUIET_THRESHOLD: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TerminalAction<U16 = u16, Text = String> {
     TypeText { text: Text },
     Resize { size: TerminalSize<U16> },
@@ -122,9 +128,19 @@ impl ActionTemplate<TerminalAction> for TerminalActionTemplate {
             _ => false,
         }
     }
+
+    fn category_hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        match self {
+            TerminalAction::TypeText { text } => text.hash(hasher),
+            TerminalAction::Resize { size } => size.hash(hasher),
+            TerminalAction::Click { row, column } => (row, column).hash(hasher),
+            TerminalAction::ScrollUp {} => "ScrollUp".hash(hasher),
+            TerminalAction::ScrollDown {} => "ScrollDown".hash(hasher),
+        }
+    }
 }
 
-impl Format for TerminalAction {
+impl<U16: Format, String: Format> Format for TerminalAction<U16, String> {
     fn format(
         &self,
         f: &mut std::fmt::Formatter,
@@ -135,7 +151,7 @@ impl Format for TerminalAction {
                     f,
                     "{} {}",
                     styled::maybe_bold("Typing".to_string()),
-                    styled::maybe_blue(format!("{:?}", text)),
+                    styled::maybe_blue(format!("{}", Formatted(text))),
                 )
             }
             TerminalAction::Resize { size } => {
@@ -143,8 +159,8 @@ impl Format for TerminalAction {
                     f,
                     "{} (columns: {}, rows: {})",
                     styled::maybe_bold("Resizing".to_string()),
-                    styled::maybe_blue(format!("{}", size.columns)),
-                    styled::maybe_blue(format!("{}", size.rows)),
+                    styled::maybe_blue(format!("{}", Formatted(&size.columns))),
+                    styled::maybe_blue(format!("{}", Formatted(&size.rows))),
                 )
             }
             TerminalAction::ScrollUp {} => {
@@ -162,8 +178,8 @@ impl Format for TerminalAction {
                     f,
                     "{} at row {}, column {}",
                     styled::maybe_bold("Clicking".to_string()),
-                    styled::maybe_blue(format!("{}", row)),
-                    styled::maybe_blue(format!("{}", column)),
+                    styled::maybe_blue(format!("{}", Formatted(row))),
+                    styled::maybe_blue(format!("{}", Formatted(column))),
                 )
             }
         }
@@ -254,8 +270,9 @@ impl InterfaceDriver for TerminalDriver {
     type Session = TerminalSession;
 
     #[hotpath::measure]
-    fn initiate(
+    fn new_session(
         &self,
+        _run_id: RunId,
     ) -> std::result::Result<(Self::Session, Verifier), anyhow::Error> {
         let verifier = Verifier::new(&self.specification_bundle)?;
         let extractor = Extractors::initialize(&self.specification_bundle)?;
@@ -290,6 +307,7 @@ impl InterfaceDriver for TerminalDriver {
                 size: self.program_options.size,
                 quiescence_timeout: self.program_options.quiescence_timeout,
                 last_action: None,
+                last_output_at: Instant::now(),
                 render_state: RenderState::new()?,
                 row_iterator: RowIterator::new()?,
                 cell_iterator: CellIterator::new()?,
@@ -307,6 +325,7 @@ pub struct TerminalSession {
     size: TerminalSize,
     quiescence_timeout: Duration,
     last_action: Option<TerminalAction>,
+    last_output_at: Instant,
     // Reused across frames: the ghostty render API is stateful and
     // optimized for repeated updates (dirty-region tracking), so these
     // are created once instead of per extracted state.
@@ -317,18 +336,23 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     #[hotpath::measure]
-    fn drain_output(&mut self, quiescence_timeout: Duration) {
+    fn drain_output(&mut self, quiescence_timeout: Duration) -> bool {
         let deadline = Instant::now() + DRAIN_DURATION_MAX;
+        let mut received_any = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match self.output.read_until(quiescence_timeout.min(remaining)) {
-                ReadResult::Chunk(data) => self.terminal.vt_write(&data),
+                ReadResult::Chunk(data) => {
+                    received_any = true;
+                    self.terminal.vt_write(&data);
+                }
                 ReadResult::Empty | ReadResult::Ended => break,
             }
         }
+        received_any
     }
 
     #[hotpath::measure]
@@ -411,7 +435,26 @@ impl InterfaceSession for TerminalSession {
 
     #[hotpath::measure]
     fn next_event(&mut self) -> Option<DriverEvent<TerminalState>> {
-        self.drain_output(self.quiescence_timeout);
+        let received = self.drain_output(self.quiescence_timeout);
+        if received {
+            self.last_output_at = Instant::now();
+        }
+        let quiet_duration =
+            Instant::now().saturating_duration_since(self.last_output_at);
+        if quiet_duration > HANG_QUIET_THRESHOLD {
+            let dropped_since_last_output = self
+                .process
+                .borrow()
+                .last_input_dropped()
+                .map(|t| t > self.last_output_at)
+                .unwrap_or(false);
+            if dropped_since_last_output {
+                return Some(DriverEvent::Error(Arc::new(anyhow!(
+                    "SUT appears hung: no output for {:.1}s and input has been dropped since",
+                    quiet_duration.as_secs_f64()
+                ))));
+            }
+        }
         match self.extract_state() {
             Ok(state) => Some(DriverEvent::StateChanged(Arc::new(state))),
             Err(error) => Some(DriverEvent::Error(Arc::new(error))),

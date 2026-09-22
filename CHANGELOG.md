@@ -1,5 +1,36 @@
 # The Bombadil Changelog
 
+## 0.7.7
+
+Minor updates:
+
+* Add experimental (and hidden) `fuzz` commands (#317, #326)
+
+Bug fixes:
+
+* Fix docker compatibility issues (#328)
+* Fix duplication of always residuals in LTL eval (#325)
+
+Internals:
+
+* Isolate cargo flags in trunk build (#330)
+* Add CI smoke test for docker container (#329)
+
+## 0.7.6
+
+Bug fixes:
+
+* Fix replay rejecting generated text (#320)
+* Don't initialize coverage module when instrumentation disabled (#321)
+
+Internal:
+
+* Replace example-based tests with Hegel property (#323)
+* Added a hiring note (#318)
+* Bump hegel version (#316)
+* Rename willow-tree to stdx, as an internal extras library (#315)
+* Split driver and session, generalize strategy (#314)
+
 ## 0.7.5
 
 Bug fixes:

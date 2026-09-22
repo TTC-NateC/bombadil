@@ -57,12 +57,12 @@ impl TextGenerator {
         value.chars().all(|char| {
             self.ranges
                 .iter()
-                .any(|(from, to)| *from <= char && char >= *to)
+                .any(|(from, to)| *from <= char && char <= *to)
         })
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum StringGenerator {
     Text { length: RangeInclusive<u16> },
     Email,
@@ -70,7 +70,7 @@ pub enum StringGenerator {
     CharSet { entries: Vec<CharSetEntry> },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CharSetEntry {
     Range(RangeInclusive<u32>),
     Literal(String),
@@ -138,7 +138,7 @@ impl StringGenerator {
     pub fn accepts(&self, value: &str) -> bool {
         match self {
             StringGenerator::Text { length } => {
-                if let Ok(value_length) = u16::try_from(value.len()) {
+                if let Ok(value_length) = u16::try_from(value.chars().count()) {
                     length.contains(&value_length)
                         && TextGenerator::new().accepts(value)
                 } else {
@@ -160,5 +160,65 @@ impl StringGenerator {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Regexp(pub String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hegel::{
+        Generator, TestCase,
+        generators::{integers, just, one_of, text, vecs},
+    };
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[hegel::test]
+    fn string_generator_accepts_generated(tc: TestCase) {
+        let generator = tc.draw(string_generators().print_as_debug());
+        let mut rng = StdRng::seed_from_u64(tc.draw(integers()));
+        let value = generator.generate(&mut rng);
+        assert!(
+            generator.accepts(&value),
+            "generator must accept all values it generates, but rejected {value:?}"
+        );
+    }
+
+    #[hegel::composite]
+    fn string_generators(tc: &TestCase) -> StringGenerator {
+        tc.draw(
+            one_of([
+                just(StringGenerator::Email).boxed(),
+                vecs(charset_entries())
+                    .min_size(1)
+                    .map(|entries| StringGenerator::CharSet { entries })
+                    .boxed(),
+            ])
+            .print_as_debug(),
+        )
+    }
+
+    #[hegel::composite]
+    fn charset_entries(tc: &TestCase) -> CharSetEntry {
+        tc.draw(
+            one_of([
+                char_ranges().map(CharSetEntry::Range).boxed(),
+                text().map(CharSetEntry::Literal).boxed(),
+            ])
+            .print_as_debug(),
+        )
+    }
+
+    #[hegel::composite]
+    fn char_ranges(tc: &TestCase) -> RangeInclusive<u32> {
+        fn in_range(tc: &TestCase, min: u32, max: u32) -> RangeInclusive<u32> {
+            let start = tc.draw(integers().min_value(min).max_value(max));
+            let end = tc.draw(integers().min_value(start).max_value(max));
+            start..=end
+        }
+
+        tc.draw(one_of([
+            just(in_range(tc, 0x0000, 0xD7FF)),
+            just(in_range(tc, 0xE000, 0x10FFFF)),
+        ]))
+    }
+}

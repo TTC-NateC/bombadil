@@ -11,7 +11,7 @@ use bombadil_schema::{Time, markup};
 use rand::SeedableRng;
 use std::{
     collections::HashMap,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 use std::{
     fmt::Display,
@@ -23,15 +23,19 @@ use tempfile::{NamedTempFile, TempDir};
 use tower_http::services::ServeDir;
 use url::Url;
 
-use bombadil::{specification::verifier::Specification, styled};
+use bombadil::{
+    driver::{RunId, TraceWriter},
+    specification::verifier::Specification,
+    styled,
+};
 use bombadil_browser::{
     browser::{BrowserOptions, Emulation, actions::BrowserAction},
     chromium::{self, LaunchOptions},
     convert::ToSchema,
     cookie::BrowserCookie,
-    driver::DebuggerOptions,
+    driver::{BrowserSession, DebuggerOptions},
     runner,
-    strategy::{TestStrategy, TraceWriter},
+    strategy::TestStrategy,
 };
 
 static INIT: Once = Once::new();
@@ -238,7 +242,6 @@ impl<'a> BrowserIntegrationTest<'a> {
         let origin =
             Url::parse(&format!("http://localhost:{}/{}", port, name,))
                 .unwrap();
-        let user_data_directory = TempDir::new().unwrap();
 
         let mut specification_file = NamedTempFile::with_suffix(".ts").unwrap();
         let specification = match specification {
@@ -276,19 +279,21 @@ impl<'a> BrowserIntegrationTest<'a> {
                 executable: chromium::locate::executable().unwrap(),
                 headless: true,
                 no_sandbox: true,
-                user_data_directory: user_data_directory.path().to_path_buf(),
             },
         };
 
         let test_start = SystemTime::now();
         let deadline = time_limit.map(|d| test_start + d);
 
-        #[derive(Default)]
-        struct ViolationsCollectingWriter {
-            violations: Vec<bombadil::runner::PropertyViolation>,
+        type CollectedViolations =
+            Arc<Mutex<Vec<bombadil::runner::PropertyViolation>>>;
+
+        #[derive(Default, Clone)]
+        struct ViolationsCollectingTraceWriter {
+            violations: CollectedViolations,
         }
 
-        impl TraceWriter for ViolationsCollectingWriter {
+        impl TraceWriter<BrowserSession> for ViolationsCollectingTraceWriter {
             fn write(
                 &mut self,
                 _state: &bombadil_browser::browser::state::BrowserState,
@@ -296,14 +301,15 @@ impl<'a> BrowserIntegrationTest<'a> {
                 _snapshots: &[bombadil::specification::domain::Snapshot],
                 violations: &[bombadil::runner::PropertyViolation],
             ) -> anyhow::Result<()> {
-                self.violations.extend_from_slice(violations);
+                self.violations
+                    .lock()
+                    .expect("failed to acquire lock for collected violations")
+                    .extend_from_slice(violations);
                 Ok(())
             }
         }
 
-        let output_path = TempDir::new().unwrap();
-        let output_path_buf = output_path.path().to_path_buf();
-        let writer = ViolationsCollectingWriter::default();
+        let trace_writer = ViolationsCollectingTraceWriter::default();
 
         enum Outcome {
             Success,
@@ -326,19 +332,19 @@ impl<'a> BrowserIntegrationTest<'a> {
             test_start: Some(Time::from_system_time(test_start)),
             deadline,
             mode: bombadil_browser::strategy::TestMode::RandomWalk,
-            writer,
             exit_on_violation: true,
             origin: origin.clone(),
-            output_path: output_path_buf,
             violations_count: 0,
         };
 
         log::info!("starting runner with infrastructure safety timeout");
         let run_result = runner::launch(
+            RunId::default(),
             origin,
             specification,
             browser_options,
             debugger_options,
+            trace_writer.clone(),
             Arc::new(AtomicBool::new(false)),
             &mut strategy,
         );
@@ -347,9 +353,8 @@ impl<'a> BrowserIntegrationTest<'a> {
             Err(error) => Outcome::Error(error),
             Ok(_) if strategy.violations_count == 0 => Outcome::Success,
             Ok(_) => {
-                let violations: Vec<String> = strategy
-                    .writer
-                    .violations
+                let violations = trace_writer.violations.lock().unwrap();
+                let violations: Vec<String> = violations
                     .iter()
                     .map(|violation| {
                         let markup =

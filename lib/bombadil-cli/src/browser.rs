@@ -1,13 +1,12 @@
 use ::url::Url;
 use antithesis_sdk::random::AntithesisRng;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bombadil_browser::{
     chromium::{self, LaunchOptions},
     convert::ToInternal,
     cookie::BrowserCookie,
-    driver::DebuggerOptions,
-    strategy::TraceWriter,
-    trace::writer::{FileTraceWriter, NoopTraceWriter},
+    driver::{BrowserDriver, BrowserSession, DebuggerOptions},
+    trace::writer::{FileOutputWriter, FileTraceWriter},
 };
 use clap::Args;
 use serde_json as json;
@@ -24,7 +23,13 @@ use std::{
 };
 use tempfile::TempDir;
 
-use bombadil::{antithesis, specification::verifier::Specification, styled};
+use bombadil::{
+    antithesis,
+    driver::{NoopTraceWriter, RunId, TraceWriter},
+    fuzzer,
+    specification::{bundler::bundle, verifier::Specification},
+    styled,
+};
 use bombadil_browser::{
     browser::{BrowserOptions, Emulation, actions::BrowserAction},
     instrumentation::InstrumentationConfig,
@@ -46,7 +51,7 @@ pub enum BrowserCommand {
     /// Run a test with a browser managed by Bombadil
     Test {
         #[clap(flatten)]
-        shared: TestSharedOptions,
+        shared: RunSharedOptions,
         /// Whether the browser should run in a visible window or not
         #[arg(long, default_value_t = false)]
         headless: bool,
@@ -58,7 +63,7 @@ pub enum BrowserCommand {
     /// --remote-debugging-port=9992`)
     TestExternal {
         #[clap(flatten)]
-        shared: TestSharedOptions,
+        shared: RunSharedOptions,
         /// Address to the remote debugger's server, e.g. http://localhost:9222
         #[arg(long)]
         remote_debugger: Url,
@@ -66,6 +71,20 @@ pub enum BrowserCommand {
         /// of starting the test (this should probably be false if you test an Electron app)
         #[arg(long)]
         create_target: bool,
+    },
+    /// Fuzz (running many tests) with a browser managed by Bombadil
+    #[command(hide = true)]
+    Fuzz {
+        #[clap(flatten)]
+        run_shared_options: RunSharedOptions,
+        #[clap(flatten)]
+        fuzz_options: FuzzOptions,
+        /// Whether the browser should run in a visible window or not
+        #[arg(long, default_value_t = false)]
+        headless: bool,
+        /// Disable Chromium sandboxing
+        #[arg(long, default_value_t = false)]
+        no_sandbox: bool,
     },
     /// Launch Bombadil Inspect to inspect a trace file
     Inspect {
@@ -81,7 +100,7 @@ pub enum BrowserCommand {
 }
 
 #[derive(Args)]
-pub struct TestSharedOptions {
+pub struct RunSharedOptions {
     /// Starting URL of the test (also used as a boundary so that Bombadil doesn't navigate to
     /// other websites)
     pub origin: Origin,
@@ -139,6 +158,20 @@ pub struct TestSharedOptions {
     pub reproduce: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct FuzzOptions {
+    /// Whether to apply swarm testing to actions. Otherwise all actions are enabled.
+    #[arg(long)]
+    pub swarm: bool,
+
+    #[arg(long, value_parser = duration::parse_duration, default_value = "5m")]
+    pub time_limit_fuzz: Duration,
+    /// Maximum time to run an individual linear run. Accepts a number with a unit suffix:
+    /// s (seconds), m (minutes), h (hours), or d (days). Examples: 30s, 5m, 2h, 1d.
+    #[arg(long, value_parser = duration::parse_duration, default_value = "30s")]
+    pub time_limit_run: Duration,
+}
+
 #[derive(Clone)]
 pub struct Origin {
     pub url: Url,
@@ -187,14 +220,11 @@ pub fn run(command: BrowserCommand) -> Result<()> {
             }
 
             let browser_options =
-                browser_options_from_shared(&shared, &output_path);
+                browser_options_from_test_shared(&shared, &output_path);
             let debugger_options = DebuggerOptions::Managed {
                 launch_options: LaunchOptions {
                     executable: chromium::locate::executable()?,
                     headless,
-                    user_data_directory: user_data_directory
-                        .path()
-                        .to_path_buf(),
                     no_sandbox,
                 },
             };
@@ -225,7 +255,7 @@ pub fn run(command: BrowserCommand) -> Result<()> {
 
             let browser_options = BrowserOptions {
                 create_target,
-                ..browser_options_from_shared(&shared, &output_path)
+                ..browser_options_from_test_shared(&shared, &output_path)
             };
             let debugger_options =
                 DebuggerOptions::External { remote_debugger };
@@ -236,6 +266,35 @@ pub fn run(command: BrowserCommand) -> Result<()> {
                 shared,
                 browser_options,
                 debugger_options,
+            )
+        }
+        BrowserCommand::Fuzz {
+            headless,
+            no_sandbox,
+            run_shared_options,
+            fuzz_options,
+        } => {
+            let output_path = output_path::resolve_output_path(
+                &run_shared_options.output_path,
+            )?;
+
+            let browser_options = browser_options_from_test_shared(
+                &run_shared_options,
+                &output_path,
+            );
+            let debugger_options = DebuggerOptions::Managed {
+                launch_options: LaunchOptions {
+                    executable: chromium::locate::executable()?,
+                    headless,
+                    no_sandbox,
+                },
+            };
+            browser_fuzz(
+                output_path,
+                run_shared_options,
+                browser_options,
+                debugger_options,
+                fuzz_options,
             )
         }
         BrowserCommand::Inspect {
@@ -293,8 +352,8 @@ fn parse_instrumentation_config(
     })
 }
 
-fn browser_options_from_shared(
-    shared: &TestSharedOptions,
+fn browser_options_from_test_shared(
+    shared: &RunSharedOptions,
     output_path: &Path,
 ) -> BrowserOptions {
     BrowserOptions {
@@ -319,7 +378,7 @@ fn browser_options_from_shared(
 
 fn reproduce_command_args(
     subcommand: &str,
-    shared: &TestSharedOptions,
+    shared: &RunSharedOptions,
 ) -> Vec<String> {
     let mut args = vec![subcommand.to_string(), shared.origin.url.to_string()];
     if let Some(path) = &shared.specification_file {
@@ -348,7 +407,7 @@ fn reproduce_command_args(
     args
 }
 
-fn resolve_test_mode(shared_options: &TestSharedOptions) -> Result<TestMode> {
+fn resolve_test_mode(shared_options: &RunSharedOptions) -> Result<TestMode> {
     match &shared_options.reproduce {
         None => Ok(TestMode::RandomWalk),
         Some(path) => {
@@ -372,7 +431,7 @@ fn browser_test(
     mode: TestMode,
     reproduce_args: Vec<String>,
     output_path: PathBuf,
-    shared_options: TestSharedOptions,
+    shared_options: RunSharedOptions,
     browser_options: BrowserOptions,
     debugger_options: DebuggerOptions,
 ) -> Result<()> {
@@ -405,6 +464,7 @@ fn browser_test(
     }
 
     let run_options = RunOptions {
+        run_id: RunId::default(),
         specification,
         browser_options,
         debugger_options,
@@ -412,18 +472,17 @@ fn browser_test(
         deadline: shared_options.time_limit.map(|d| SystemTime::now() + d),
         origin: shared_options.origin.url,
         exit_on_violation: shared_options.exit_on_violation,
-        output_path: output_path.clone(),
     };
 
     let test_result = if antithesis::is_in_guest() {
-        run_with_writer(NoopTraceWriter, run_options)?
+        run_with_writer(run_options, NoopTraceWriter)?
     } else {
         run_with_writer(
+            run_options,
             FileTraceWriter::initialize(
-                run_options.output_path.clone(),
+                output_path.clone(),
                 shared_options.output_path_overwrite,
             )?,
-            run_options,
         )?
     };
 
@@ -490,7 +549,140 @@ fn browser_test(
     Ok(())
 }
 
+fn browser_fuzz(
+    output_path: PathBuf,
+    shared_options: RunSharedOptions,
+    browser_options: BrowserOptions,
+    debugger_options: DebuggerOptions,
+    fuzz_options: FuzzOptions,
+) -> Result<()> {
+    if antithesis::is_in_guest() {
+        bail!(
+            "bombadil fuzzing mode is not available in antithesis; use `test` or `test-external`"
+        );
+    };
+
+    // Load a user-provided specification, or use the defaults provided by Bombadil.
+    let specification = if let Some(path) = &shared_options.specification_file {
+        let path = if path.is_relative() && !path.starts_with(".") {
+            PathBuf::from(".").join(path)
+        } else {
+            path.clone()
+        };
+        log::info!("loading specification from file: {}", path.display());
+        Specification {
+            module_specifier: path.display().to_string(),
+        }
+    } else {
+        log::info!("using default specification");
+        Specification {
+            module_specifier: "@antithesishq/bombadil/browser/defaults"
+                .to_string(),
+        }
+    };
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = interrupted.clone();
+        ctrlc::set_handler(move || {
+            interrupted.store(true, Ordering::SeqCst);
+        })?;
+    }
+
+    let specification_bundle =
+        Arc::from(bundle(".", &specification.module_specifier)?);
+
+    let output_writer = FileOutputWriter {
+        root_path: output_path.clone(),
+        overwrite: shared_options.output_path_overwrite,
+    };
+
+    let driver = Arc::new(BrowserDriver {
+        origin: shared_options.origin.url,
+        browser_options,
+        debugger_options,
+        specification_bundle,
+    });
+
+    fuzzer::fuzz(fuzzer::FuzzOptions {
+        rng: AntithesisRng,
+        driver,
+        interrupted,
+        time_limit_fuzz: fuzz_options.time_limit_fuzz,
+        time_limit_run: fuzz_options.time_limit_run,
+        swarm: fuzz_options.swarm,
+        output_writer,
+    })?;
+
+    // TODO: return result from `fuzz` that can be used to print something like the following:
+
+    /*
+    let heading = {
+        let TestResult {
+            exit_reason,
+            violations_count,
+        } = test_result;
+
+        let findings = match violations_count {
+            0 => "".into(),
+            1 => ", finding 1 violation".into(),
+            n => format!(", finding {n} violations"),
+        };
+
+        let heading = styled::maybe_bold(match exit_reason {
+            ExitReason::ExitOnViolation => {
+                format!("Test finished{findings}!",)
+            }
+            ExitReason::TimeLimit => {
+                format!("Test finished after time limit{findings}!")
+            }
+            ExitReason::Interrupted => {
+                format!("Test was interrupted by SIGINT{findings}!",)
+            }
+            ExitReason::Reproduced => {
+                format!("Reproduction finished{findings}!",)
+            }
+            ExitReason::AllDefinite => {
+                format!("Test finished with all properties definite{findings}!")
+            }
+        });
+
+        if violations_count > 0 {
+            styled::maybe_red(heading)
+        } else {
+            heading
+        }
+    };
+
+    let output_display = output_path.display();
+    let inspect_command = styled::maybe_italic(format!(
+        "bombadil browser inspect {output_display}"
+    ));
+    println!(
+        "\n{heading}\n\nInspect the test results using:\
+         \n\n  {inspect_command}\n",
+    );
+    if !is_reproduce {
+        let reproduce_command = styled::maybe_italic(format!(
+            "bombadil {} --reproduce {output_display}",
+            reproduce_args.join(" "),
+        ));
+        println!(
+            "Reproduce this test using:\
+             \n\n  {reproduce_command}\n",
+        );
+    }
+
+    if test_result.violations_count > 0 {
+        std::process::exit(2);
+    }
+        */
+
+    Ok(())
+}
+
 struct RunOptions {
+    run_id: RunId,
     origin: Url,
     specification: Specification,
     browser_options: BrowserOptions,
@@ -498,12 +690,11 @@ struct RunOptions {
     mode: TestMode,
     exit_on_violation: bool,
     deadline: Option<SystemTime>,
-    output_path: PathBuf,
 }
 
-fn run_with_writer(
-    writer: impl TraceWriter,
+fn run_with_writer<Writer: TraceWriter<BrowserSession>>(
     RunOptions {
+        run_id,
         origin,
         specification,
         browser_options,
@@ -511,8 +702,8 @@ fn run_with_writer(
         mode,
         exit_on_violation,
         deadline,
-        output_path: strategy_output_path,
     }: RunOptions,
+    trace_writer: Writer,
 ) -> Result<TestResult> {
     let interrupted = Arc::new(AtomicBool::new(false));
     {
@@ -525,20 +716,20 @@ fn run_with_writer(
     let mut strategy = TestStrategy {
         rng: AntithesisRng,
         mode,
-        writer,
         exit_on_violation,
         test_start: None,
         deadline,
-        output_path: strategy_output_path,
         violations_count: 0,
         origin: origin.clone(),
     };
 
     bombadil_browser::runner::launch(
+        run_id,
         origin,
         specification,
         browser_options,
         debugger_options,
+        trace_writer,
         interrupted,
         &mut strategy,
     )
